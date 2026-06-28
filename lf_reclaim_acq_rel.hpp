@@ -28,7 +28,7 @@ public:
     std::optional<T> result = std::nullopt;
     if (to_delete) {
       result = to_delete->value;
-      to_delete->next = delete_list.load(std::memory_order_relaxed);
+      to_delete->next = delete_list.load(std::memory_order_acquire);
       while (!delete_list.compare_exchange_weak(to_delete->next, to_delete, std::memory_order_release, std::memory_order_acquire))
         ;
     }
