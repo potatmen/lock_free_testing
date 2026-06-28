@@ -106,16 +106,16 @@ BENCHMARK(BM_Reclaim_AR)->Threads(1)->Threads(2)->Threads(4)->Threads(8)->Thread
 ```
 
 ```
-CPU: Apple M1, clang++ -O2, 2026-06-28 (averaged over 10 runs)
+CPU: Apple M1, clang++ -O2, 2026-06-28 (averaged over 5 runs)
 -------------------------------------------------------------------------
 Benchmark                           1T       2T       4T       8T      16T
 -------------------------------------------------------------------------
-BM_Leaking_SC                     22.5      101      279     1937     3701
-BM_Leaking_AR                     21.2       93      348     2002     3525
-BM_Reclaim_SC                     41.6      214      608     3307     6204
-BM_Reclaim_AR                     40.0      208      594     3179     5838
-BM_Reclaim_AR_Padded              40.3      210      566     3162     5930
-BM_Blocking                       30.7      124      309      955     2239
+BM_Leaking_SC                     22.4      100      292     1897     3799
+BM_Leaking_AR                     21.3       93      345     2061     3801
+BM_Reclaim_SC                     42.2      210      615     3333     6485
+BM_Reclaim_AR                     40.1      202      585     3227     6063
+BM_Reclaim_AR_Padded              40.0      210      575     3053     6013
+BM_Blocking                       30.6      123      313      956     2238
 -------------------------------------------------------------------------
 (all times in nanoseconds)
 
