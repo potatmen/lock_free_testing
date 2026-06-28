@@ -8,7 +8,7 @@ template <typename T> class LockFreeStack {
     T value;
     Node *next;
   };
-  alignas(64) std::atomic<Node *> head{nullptr};
+  alignas(128) std::atomic<Node *> head{nullptr};
   std::atomic<int> counter{0};
   std::atomic<Node *> delete_list{nullptr};
 
