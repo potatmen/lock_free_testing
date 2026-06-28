@@ -68,7 +68,7 @@ Adds reference-counted safe reclamation:
 - Popped nodes go to `delete_list` instead of being freed immediately — we cannot `delete` straight away because another thread may have loaded the same node from `head` just before our CAS succeeded and is still holding a pointer to it.
 - When `counter == 1` (only the current thread is in `pop()`), no other thread can hold a stale pointer, so draining `delete_list` is safe.
 
-**Known liveness issue:** there is a window between `delete_list.exchange(nullptr)` and `counter.fetch_sub` where a new thread can enter, add a node to the freshly-emptied `delete_list`, observe `counter > 1`, and exit without freeing — orphaning that node until the destructor.
+**Known memory issue:** there is a window between `delete_list.exchange(nullptr)` and `counter.fetch_sub` where a new thread can enter, add a node to the freshly-emptied `delete_list`, observe `counter > 1`, and exit without freeing. Under sustained concurrent load `counter` rarely hits 1, so popped nodes accumulate in `delete_list` indefinitely — memory is only reclaimed when the destructor runs. For a long-lived stack this is effectively a leak for the duration of the program.
 
 Memory orders still `seq_cst`.
 
@@ -86,7 +86,7 @@ Same reclamation logic with `seq_cst` replaced by `acq/rel` throughout. `seq_cst
 
 **Why only `head`?** `push()` only touches `head`. Without alignment, a push on one thread can invalidate the cache line containing `counter` and `delete_list` on another thread mid-pop, even though push never writes to those variables. Aligning `head` to its own line prevents push from causing spurious invalidations of the pop-side state.
 
-**Why not align all three?** We tried. With `counter` and `delete_list` each on their own 128-byte line the numbers are consistently worse (see benchmark). `pop()` accesses all three atomics in tight sequence; keeping `counter` and `delete_list` co-located preserves spatial locality for that access pattern. The exact mechanism is still under investigation.
+**Why not align all three?** I tried. With `counter` and `delete_list` each on their own 128-byte line the numbers are consistently worse (see benchmark). Under investigation.
 
 ---
 
@@ -127,18 +127,17 @@ BM_Reclaim_AR_Padded              40.2      201      625     3732     7002
 
 - **Single thread:** leaking variants are fastest (~21 ns) — no reclamation overhead. Blocking pays mutex acquire/release (~30 ns). Reclaim variants pay the `counter` fetch-add/sub and `delete_list` CAS (~40 ns).
 
-- **seq_cst vs acq/rel:** a visible gap appears at 16 threads — leaking_sc averages 3701 ns, leaking_ar averages 3525 ns (~5% faster). `seq_cst` emits a fence not present in `acq/rel`; under high thread counts the cost accumulates.
+- **seq_cst vs acq/rel:** no meaningful difference in the averaged results — leaking_sc and leaking_ar are within noise at all thread counts. The fence cost does not surface in this tight loop pattern.
 
 - **Reclamation cost:** roughly 2× the leaking variant at single thread, growing with thread count due to contention on `counter` and `delete_list`.
 
-- **Padding gain at 4–8T:** head-only `alignas(128)` gives ~5% at 4T and ~1% at 8T over the unpadded reclaim variant. Aligning all three atomics separately is consistently worse — spatial locality for pop()'s sequential access to all three outweighs the false-sharing reduction.
+- **Padding gain:** head-only `alignas(128)` gives ~2% at 4T and ~5% at 8T over the unpadded reclaim variant. Aligning all three atomics separately is consistently worse — under investigation.
 
-- **Blocking beats lock-free at scale:** the mutex outperforms every lock-free variant above 2 threads in this benchmark. Under maximum contention the OS sleep/wake in the mutex eliminates the CAS retry storm. This is a known characteristic of tight push/pop microbenchmarks. WIP — investigating whether this holds under more realistic producer/consumer access patterns.
+- **Blocking beats lock-free from 8T upward:** leaking variants are still faster than the mutex at 4T (leaking_sc 292 ns vs blocking 313 ns). From 8T the mutex wins across the board — under maximum contention the OS sleep/wake eliminates the CAS retry storm. This is a known characteristic of tight push/pop microbenchmarks. WIP — investigating whether this holds under more realistic producer/consumer access patterns.
 
 ---
 
 ## What is missing
 
-**Correctness:**
-- **Reclamation liveness bug:** nodes can be orphaned in `delete_list` between `exchange(nullptr)` and `counter.fetch_sub` as described above. A proper fix requires a different reclamation scheme (hazard pointers, epoch-based reclamation).
+- **Reclamation:** the current scheme uses deferred deletion — popped nodes are not freed immediately but held in `delete_list` until it is safe to reclaim them. The problem is that under sustained concurrent load the safe moment may never arrive, causing `delete_list` to grow without bound for the lifetime of the stack.
 - **Sanitizer runs:** the correctness test passes under `assert` but has not been run under ThreadSanitizer (`-fsanitize=thread`) or AddressSanitizer (`-fsanitize=address`). To be added.
