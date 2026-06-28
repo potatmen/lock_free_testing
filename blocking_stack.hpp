@@ -1,35 +1,35 @@
 #pragma once
 #include <mutex>
 #include <optional>
-#include <stack>
 
 template <typename T> class BlockingStack {
-  std::stack<T> st;
-  size_t maxSize;
+  struct Node {
+    T value;
+    Node *next;
+  };
+  Node *head{nullptr};
   std::mutex mtx;
 
 public:
-  BlockingStack(const size_t &maxSize) : maxSize(maxSize) {}
-
-  bool push(T value) {
+  void push(T value) {
+    Node *newNode = new Node{std::move(value), head};
     std::lock_guard lc(mtx);
-    if (st.size() == maxSize)
-      return false;
-    st.push(std::move(value));
-    return true;
+    newNode->next = head;
+    head = newNode;
   }
 
   std::optional<T> pop() {
     std::lock_guard lck(mtx);
-    if (st.empty())
+    if (!head)
       return std::nullopt;
-    T result = std::move(st.top());
-    st.pop();
+    Node *to_delete = head;
+    head = head->next;
+    T result = std::move(to_delete->value);
+    delete to_delete;
     return result;
   }
 
   ~BlockingStack() {
-    while (auto element = pop())
-      ;
+    while (auto v = pop()) {}
   }
 };
