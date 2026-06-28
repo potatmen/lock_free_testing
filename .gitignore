@@ -1,0 +1,5 @@
+tests/lock_free_stack_test
+tests/lock_free_stack_test_tsan
+tests/blocking_stack_test
+tests/blocking_stack_test_tsan
+tests/bench
