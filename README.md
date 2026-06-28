@@ -19,7 +19,7 @@ A step-by-step exploration of lock-free stack design in C++17, from a mutex base
 
 ### `blocking_stack.hpp` — mutex baseline
 
-A `std::mutex`-guarded linked list. Simple, correct, no ABA risk, immediate `delete` of popped nodes.  
+A `std::mutex`-guarded linked list. Simple, correct, immediate `delete` of popped nodes.  
 Used as the performance reference point.
 
 ---
@@ -29,18 +29,33 @@ Used as the performance reference point.
 First lock-free attempt. `head` is `std::atomic<Node*>`; push and pop use `compare_exchange_weak` with default `memory_order_seq_cst`.
 
 **Issues:**
-- `seq_cst` emits full memory fences on every CAS — unnecessary for a single shared pointer.
+- `seq_cst` emits full memory fences on every CAS — stronger than needed for this data structure.
 - Popped nodes are **never deleted** (memory leak).
 
 ---
 
 ### `lf_leaking_acq_rel.hpp` — lock-free, acq/rel, leaking
 
-Relaxed the memory orders:
-- Push CAS: `release` on success, `relaxed` on failure — publishes the new node.
-- Pop CAS: `acquire` on success (synchronises with the push that wrote the node's `next`), `acquire` on failure (needed to correctly read `next` of any newly-pushed node encountered during retries).
+Relaxed the memory orders to the minimum required for correctness:
 
-**Why acquire on failure?** If a new node D is pushed while the pop loop is spinning, the failure path updates `to_delete = D` with no ordering. A subsequent relaxed read of `D->next` would be unsynchronised with D's push on weakly-ordered architectures (ARM, POWER). Keeping `acquire` on failure covers this.
+```cpp
+// push
+Node *newNode = new Node{std::move(value), head.load(std::memory_order_acquire)};
+while (!head.compare_exchange_weak(newNode->next, newNode,
+                                   std::memory_order_release,   // success: publishes the new node
+                                   std::memory_order_relaxed))  // failure: only needs the pointer value
+  ;
+
+// pop
+Node *to_delete = head.load(std::memory_order_acquire);
+while (!head.compare_exchange_weak(
+    to_delete, to_delete ? to_delete->next : nullptr,
+    std::memory_order_acquire,   // success: synchronises with the push that wrote next
+    std::memory_order_acquire))  // failure: needed to correctly read next of a newly-pushed node
+  ;
+```
+
+**Why acquire on pop failure?** If a new node D is pushed while the pop loop is spinning, the failure path updates `to_delete = D`. To read `D->next` correctly on the next iteration, we need to synchronise with D's push. A relaxed failure load gives no such guarantee.
 
 Still leaks memory.
 
@@ -50,78 +65,80 @@ Still leaks memory.
 
 Adds reference-counted safe reclamation:
 - `counter` tracks threads currently inside `pop()`.
-- Popped nodes go to `delete_list` instead of being freed immediately.
-- When `counter == 1` (only the current thread is in `pop()`), it is safe to drain `delete_list` — no other thread holds a pointer into it.
+- Popped nodes go to `delete_list` instead of being freed immediately — we cannot `delete` straight away because another thread may have loaded the same node from `head` just before our CAS succeeded and is still holding a pointer to it.
+- When `counter == 1` (only the current thread is in `pop()`), no other thread can hold a stale pointer, so draining `delete_list` is safe.
+
+**Known liveness issue:** there is a window between `delete_list.exchange(nullptr)` and `counter.fetch_sub` where a new thread can enter, add a node to the freshly-emptied `delete_list`, observe `counter > 1`, and exit without freeing — orphaning that node until the destructor.
 
 Memory orders still `seq_cst`.
-
-**Known liveness issue:** there is a window between `delete_list.exchange(nullptr)` and `counter.fetch_sub` where a new thread can enter, add a node to the freshly-emptied `delete_list`, observe `counter > 1`, and exit without freeing. That node stays in `delete_list` until the next time a thread is alone (`counter == 1`) or until the destructor runs. Under sustained saturation the list can grow unboundedly. Production systems use hazard pointers or epoch-based reclamation to avoid this.
 
 ---
 
 ### `lf_reclaim_acq_rel.hpp` — reclamation, acq/rel
 
-Switched reclamation variant to acq/rel orders. `seq_cst` and `acq/rel` produce nearly identical numbers on this benchmark (M1's load-acquire / store-release map directly to `ldar`/`stlr`; `seq_cst` adds `dmb` barriers that the tight loop doesn't expose).
+Same reclamation logic with `seq_cst` replaced by `acq/rel` throughout. `seq_cst` and `acq/rel` produce nearly identical numbers on this benchmark.
 
 ---
 
 ### `lf_reclaim_ar_padded.hpp` — reclamation, acq/rel, cache-line padded
 
-`head` is declared `alignas(128)` — matching the M1's actual cache line size — to prevent it from sharing a cache line with unrelated data in surrounding objects.
+`head` is declared `alignas(128)` to place it on its own cache line.
 
-**What was changed:** only `head` carries the alignment. `counter` and `delete_list` immediately follow at offsets +8 and +16 within the same 128-byte line, so all three hot atomics still share one cache line. The improvement at 8T is real but partial — `head` is isolated from external neighbours, while contention between the three atomics themselves is unresolved.
+**Why only `head`?** `push()` only touches `head`. Without alignment, a push on one thread can invalidate the cache line containing `counter` and `delete_list` on another thread mid-pop, even though push never writes to those variables. Aligning `head` to its own line prevents push from causing spurious invalidations of the pop-side state.
+
+**Why not align all three?** We tried. With `counter` and `delete_list` each on their own 128-byte line the numbers are consistently worse (see benchmark). `pop()` accesses all three atomics in tight sequence; keeping `counter` and `delete_list` co-located preserves spatial locality for that access pattern. The exact mechanism is still under investigation.
 
 ---
 
-## Benchmark results
+## Benchmark
 
-Each benchmark calls `push` then `pop` in a tight loop per thread. Time shown is **wall-clock ns per push+pop pair per thread**.
+Each benchmark calls `push` then `pop` in a tight loop per thread on a shared static stack instance. Time shown is **wall-clock ns per push+pop pair per thread**.
+
+```cpp
+static void BM_Reclaim_AR(benchmark::State &state) {
+  static reclaim_ar::LockFreeStack<int> s;
+  for (auto _ : state) {
+    s.push(state.thread_index());
+    benchmark::DoNotOptimize(s.pop());
+  }
+}
+BENCHMARK(BM_Reclaim_AR)->Threads(1)->Threads(2)->Threads(4)->Threads(8)->Threads(16);
+```
 
 ```
-CPU: Apple M1, clang++ -O2, 2026-06-28 (averaged over 3 runs)
+CPU: Apple M1, clang++ -O2, 2026-06-28 (averaged over 10 runs)
 -------------------------------------------------------------------------
 Benchmark                           1T       2T       4T       8T      16T
 -------------------------------------------------------------------------
-BM_Leaking_SC                     22.9       93      280     2244     4286
-BM_Leaking_AR                     21.4       91      352     2145     3753
-BM_Reclaim_SC                     42.0      209      610     3248     6400
-BM_Reclaim_AR                     40.8      209      588     3267     6071
-BM_Reclaim_AR_Padded              40.2      209      556     2854     6276
-BM_Blocking                       30.7      124      309      945     2338
+BM_Leaking_SC                     22.5      101      279     1937     3701
+BM_Leaking_AR                     21.2       93      348     2002     3525
+BM_Reclaim_SC                     41.6      214      608     3307     6204
+BM_Reclaim_AR                     40.0      208      594     3179     5838
+BM_Reclaim_AR_Padded              40.3      210      566     3162     5930
+BM_Blocking                       30.7      124      309      955     2239
 -------------------------------------------------------------------------
 (all times in nanoseconds)
+
+All-3-padded experiment (alignas(128) on head + counter + delete_list, 5 runs):
+BM_Reclaim_AR_Padded              40.2      201      625     3732     7002
 ```
 
 **Observations:**
 
-- **Single thread:** leaking variants are fastest (~21 ns) — no reclamation overhead. Blocking pays mutex lock/unlock (~30 ns). Reclaim variants pay the `counter` fetch-add/sub and `delete_list` CAS (~41 ns).
+- **Single thread:** leaking variants are fastest (~21 ns) — no reclamation overhead. Blocking pays mutex acquire/release (~30 ns). Reclaim variants pay the `counter` fetch-add/sub and `delete_list` CAS (~40 ns).
 
-- **seq_cst vs acq/rel:** the averaged results show a visible gap at 16 threads between leaking_sc (4286 ns) and leaking_ar (3753 ns, ~12% faster). On M1, `seq_cst` CAS emits a `dmb ish` barrier not present in `acq/rel`; under high thread counts that barrier cost accumulates. On x86 the difference would be larger because `seq_cst` stores require `MFENCE` or `LOCK XCHG`.
+- **seq_cst vs acq/rel:** a visible gap appears at 16 threads — leaking_sc averages 3701 ns, leaking_ar averages 3525 ns (~5% faster). `seq_cst` emits a fence not present in `acq/rel`; under high thread counts the cost accumulates.
 
-- **Reclamation cost:** roughly 2× the leaking variant at single thread; overhead grows with thread count due to contention on `counter` and `delete_list`.
+- **Reclamation cost:** roughly 2× the leaking variant at single thread, growing with thread count due to contention on `counter` and `delete_list`.
 
-- **Padding gain at 8T:** `alignas(128)` reduces per-op latency by ~13% at 8 threads (2854 ns vs 3267 ns). The gain is consistent across runs because `head` is no longer invalidated by writes to neighbouring fields in surrounding objects.
+- **Padding gain at 4–8T:** head-only `alignas(128)` gives ~5% at 4T and ~1% at 8T over the unpadded reclaim variant. Aligning all three atomics separately is consistently worse — spatial locality for pop()'s sequential access to all three outweighs the false-sharing reduction.
 
-- **Padding at 16T:** the benefit disappears (6276 ns padded vs 6071 ns unpadded, within noise). At 16 threads all cores are hammering `counter` and `delete_list`, which still share the same 128-byte line as `head`. Separating all three atomics onto individual lines is the next required step.
-
-- **Blocking beats lock-free at scale:** the mutex outperforms every lock-free variant above 2 threads in this synthetic benchmark. The tight push/pop loop creates maximum contention; under such conditions the OS sleep/wake in the mutex eliminates the CAS retry storm that the lock-free variants suffer. This is a known pathology of purely contention-bound microbenchmarks — real workloads with non-trivial critical sections or SPSC access patterns favour the lock-free approach.
+- **Blocking beats lock-free at scale:** the mutex outperforms every lock-free variant above 2 threads in this benchmark. Under maximum contention the OS sleep/wake in the mutex eliminates the CAS retry storm. This is a known characteristic of tight push/pop microbenchmarks. WIP — investigating whether this holds under more realistic producer/consumer access patterns.
 
 ---
 
-## What is missing / next improvements
+## What is missing
 
 **Correctness:**
-- **Reclamation liveness bug:** nodes added to `delete_list` during the window between `delete_list.exchange(nullptr)` and `counter.fetch_sub` are orphaned until the destructor. Under sustained concurrent load, `delete_list` can grow without bound. Fix requires hazard pointers or epoch-based reclamation (e.g. `std::hazard_pointer` from C++26, or a manual EBR implementation).
-- **No sanitizer runs:** the correctness test passes under `assert`, but the code has never been run under ThreadSanitizer (`-fsanitize=thread`) or AddressSanitizer (`-fsanitize=address`). TSan would catch memory-order races on non-x86 memory models; ASan would catch use-after-free in the reclamation path.
-
-**Performance:**
-- **Full cache-line isolation:** `counter` and `delete_list` share the same 128-byte line as `head`. Each needs its own line to eliminate remaining false-sharing:
-  ```cpp
-  alignas(128) std::atomic<Node*> head{nullptr};
-  alignas(128) std::atomic<int>   counter{0};
-  alignas(128) std::atomic<Node*> delete_list{nullptr};
-  ```
-  This is the direct next step for the padded variant and would likely recover the lost gain at 16 threads.
-- **Shared `delete_list` is a bottleneck:** every thread contends on the same `delete_list` CAS. Per-thread pending lists (merged on drain) would reduce this to a single-writer path per thread.
-- **Heap allocator contention:** `new`/`delete` under concurrent load serialises on the allocator's internal lock. A thread-local free-list or a lock-free slab allocator (e.g. jemalloc, mimalloc) would remove this hidden bottleneck, which currently dominates at high thread counts.
-- **Benchmark models only worst-case contention:** all threads push and pop on the same stack simultaneously. A separate-producer/consumer benchmark (SPSC or bounded MPMC) would better reflect real workload access patterns where the lock-free advantage over mutex is more pronounced.
+- **Reclamation liveness bug:** nodes can be orphaned in `delete_list` between `exchange(nullptr)` and `counter.fetch_sub` as described above. A proper fix requires a different reclamation scheme (hazard pointers, epoch-based reclamation).
+- **Sanitizer runs:** the correctness test passes under `assert` but has not been run under ThreadSanitizer (`-fsanitize=thread`) or AddressSanitizer (`-fsanitize=address`). To be added.
