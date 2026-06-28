@@ -69,15 +69,7 @@ Switched reclamation variant to acq/rel orders. `seq_cst` and `acq/rel` produce 
 
 `head` is declared `alignas(128)` — matching the M1's actual cache line size — to prevent it from sharing a cache line with unrelated data in surrounding objects.
 
-**Remaining gap:** `counter` and `delete_list` immediately follow `head` in memory (offsets +8 and +16 within the same 128-byte line). All three hot atomics are still on one cache line. A complete fix gives each its own line:
-
-```cpp
-alignas(128) std::atomic<Node*> head{nullptr};
-alignas(128) std::atomic<int>   counter{0};
-alignas(128) std::atomic<Node*> delete_list{nullptr};
-```
-
-The improvement visible at 8–16 threads reflects that `head` no longer shares a line with surrounding object data, but contention between `head`, `counter`, and `delete_list` themselves is unresolved.
+**What was changed:** only `head` carries the alignment. `counter` and `delete_list` immediately follow at offsets +8 and +16 within the same 128-byte line, so all three hot atomics still share one cache line. The improvement at 8T is real but partial — `head` is isolated from external neighbours, while contention between the three atomics themselves is unresolved.
 
 ---
 
@@ -123,7 +115,13 @@ BM_Blocking                       30.7      124      309      945     2338
 - **No sanitizer runs:** the correctness test passes under `assert`, but the code has never been run under ThreadSanitizer (`-fsanitize=thread`) or AddressSanitizer (`-fsanitize=address`). TSan would catch memory-order races on non-x86 memory models; ASan would catch use-after-free in the reclamation path.
 
 **Performance:**
-- **Full cache-line isolation:** `counter` and `delete_list` share the same 128-byte line as `head`. Each should be `alignas(128)` to eliminate remaining false-sharing between them under high thread counts.
+- **Full cache-line isolation:** `counter` and `delete_list` share the same 128-byte line as `head`. Each needs its own line to eliminate remaining false-sharing:
+  ```cpp
+  alignas(128) std::atomic<Node*> head{nullptr};
+  alignas(128) std::atomic<int>   counter{0};
+  alignas(128) std::atomic<Node*> delete_list{nullptr};
+  ```
+  This is the direct next step for the padded variant and would likely recover the lost gain at 16 threads.
 - **Shared `delete_list` is a bottleneck:** every thread contends on the same `delete_list` CAS. Per-thread pending lists (merged on drain) would reduce this to a single-writer path per thread.
 - **Heap allocator contention:** `new`/`delete` under concurrent load serialises on the allocator's internal lock. A thread-local free-list or a lock-free slab allocator (e.g. jemalloc, mimalloc) would remove this hidden bottleneck, which currently dominates at high thread counts.
 - **Benchmark models only worst-case contention:** all threads push and pop on the same stack simultaneously. A separate-producer/consumer benchmark (SPSC or bounded MPMC) would better reflect real workload access patterns where the lock-free advantage over mutex is more pronounced.
