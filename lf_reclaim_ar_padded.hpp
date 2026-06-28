@@ -9,8 +9,8 @@ template <typename T> class LockFreeStack {
     Node *next;
   };
   alignas(64) std::atomic<Node *> head{nullptr};
-  alignas(64) std::atomic<int> counter{0};
-  alignas(64) std::atomic<Node *> delete_list{nullptr};
+  std::atomic<int> counter{0};
+  std::atomic<Node *> delete_list{nullptr};
 
 public:
   void push(T value) {
